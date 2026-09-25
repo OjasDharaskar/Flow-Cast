@@ -14,19 +14,32 @@ def load_datasets():
     return calendar, weather, sensors
 
 def tz_parsing(df: pd.DataFrame, date_col: str, time_col: str = None, target_tz: str = 'Asia/Kolkata') -> pd.DataFrame:
-    # We use format 'mixed' to support DD/MM/YYYY vs YYYY-MM-DD
+    # Safely combine date and time strings, filling missing values to prevent concatenation errors
     if time_col and time_col in df.columns:
-        combined_date_time = pd.to_datetime(df[date_col] + ' ' + df[time_col], format='mixed')
+        raw_series = df[date_col].astype(str).str.strip() + ' ' + df[time_col].astype(str).str.strip()
+        # Clean up cases where time or date was 'nan' or 'NaT'
+        raw_series = raw_series.replace(['nan nan', 'NaT NaT', 'nan', 'NaT'], pd.NA)
         df.drop(columns=[date_col, time_col], inplace=True)
     else:
-        combined_date_time = pd.to_datetime(df[date_col], format='mixed')
+        raw_series = df[date_col].astype(str).str.strip()
+        raw_series = raw_series.replace(['nan', 'NaT'], pd.NA)
         df.drop(columns=[date_col], inplace=True)
         
+    # Parse to datetime safely using errors='coerce' so bad rows become NaT instead of crashing
+    try:
+        combined_date_time = pd.to_datetime(raw_series, format='mixed', errors='coerce')
+    except (TypeError, ValueError):
+        # Fallback for older Pandas versions (< 2.0) that don't support format='mixed'
+        combined_date_time = pd.to_datetime(raw_series, errors='coerce')
+        
     # Localize (if it's not already tz-aware)
-    if combined_date_time.dt.tz is None:
-        df['timestamp'] = combined_date_time.dt.tz_localize(target_tz, ambiguous='NaT', nonexistent='NaT')
+    if getattr(combined_date_time.dt, 'tz', None) is None:
+        # Localize only non-NaT values to prevent timezone localization errors on missing data
+        localized = combined_date_time.dt.tz_localize(target_tz, ambiguous='NaT', nonexistent='NaT')
+        df['timestamp'] = localized
     else:
         df['timestamp'] = combined_date_time.dt.tz_convert(target_tz)
+        
     return df
 
 def validate_sensor_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -80,4 +93,4 @@ def validate_weather_data(df: pd.DataFrame) -> pd.DataFrame:
         },
         coerce=True
     )
-    return schema.validate(df)
+    return schema.validate(df)

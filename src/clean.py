@@ -5,6 +5,7 @@ import numpy as np
 import json
 from ingest import load_datasets, tz_parsing, validate_sensor_data, validate_calendar_data, validate_weather_data
 
+
 def process_data():
     print("Loading datasets...")
     calendar, weather, sensors = load_datasets()
@@ -19,6 +20,14 @@ def process_data():
     calendar = tz_parsing(calendar, 'date', None)
     weather = tz_parsing(weather, 'date', 'time')
     sensors = tz_parsing(sensors, 'date', 'time')
+    
+    # --- CRITICAL FIX: Force all timestamp columns to actual datetime type ---
+    sensors['timestamp'] = pd.to_datetime(sensors['timestamp'], errors='coerce')
+    weather['timestamp'] = pd.to_datetime(weather['timestamp'], errors='coerce')
+    calendar['timestamp'] = pd.to_datetime(calendar['timestamp'], errors='coerce')
+
+    # Ensure sensor timestamps are strictly 30-minute intervals
+    sensors = normalised_timestamp(sensors)
 
     print("Cleaning sensor data...")
     # Duplicate removal
@@ -29,6 +38,16 @@ def process_data():
     sensors['traffic_volume'] = sensors['traffic_volume'].clip(lower=0)
     sensors.loc[sensors['avg_speed'] > 200, 'avg_speed'] = np.nan
     sensors['occupancy'] = sensors['occupancy'].clip(upper=100)
+    
+    # Statistical Outlier Detection (IQR)
+    def iqr_cap(s):
+        Q1, Q3 = s.quantile(0.25), s.quantile(0.75)
+        IQR = Q3 - Q1
+        return s.clip(lower=Q1 - 1.5*IQR, upper=Q3 + 1.5*IQR)
+        
+    for col in ['traffic_volume', 'avg_speed']:
+        if col in sensors.columns:
+            sensors[col] = sensors.groupby('road_id')[col].transform(iqr_cap)
 
     # Missing value handling
     # Sort for interpolation
@@ -41,7 +60,6 @@ def process_data():
     sensors['traffic_volume'] = sensors['traffic_volume'].fillna(sensors['traffic_volume'].median())
     
     # Missing Congestion Level
-    # Derive from occupancy/volume/capacity logic. Just placeholder if missing:
     sensors['congestion_level'] = sensors['congestion_level'].fillna('Unknown')
 
     print("Cleaning weather data...")
@@ -51,16 +69,11 @@ def process_data():
 
     print("Aligning and Merging datasets...")
     # Align weather (hourly) to sensors (30-min)
-    # Forward fill hourly data onto 30 min intervals by joining on time
-    # Round sensor timestamp to floor hour to join with weather
     sensors['hour_timestamp'] = sensors['timestamp'].dt.floor('h')
     
-    # Weather might not have road_id, just timestamp (or station_id).
-    # Assuming weather maps globally if station_id not joined, or left merge on timestamp and station_id
     if 'station_id' in weather.columns and 'weather_station_id' in sensors.columns:
         merged = pd.merge(sensors, weather, left_on=['weather_station_id', 'hour_timestamp'], right_on=['station_id', 'timestamp'], how='left', suffixes=('', '_weather'))
     else:
-        # Fallback to just time if no stations
         merged = pd.merge(sensors, weather, left_on='hour_timestamp', right_on='timestamp', how='left', suffixes=('', '_weather'))
     
     # Drop intermediate columns
@@ -68,7 +81,6 @@ def process_data():
         merged.drop(columns=['timestamp_weather', 'hour_timestamp'], inplace=True)
 
     # Merge calendar (daily)
-    # Floor timestamp to day
     merged['day_timestamp'] = merged['timestamp'].dt.floor('D')
     merged = pd.merge(merged, calendar, left_on='day_timestamp', right_on='timestamp', how='left', suffixes=('', '_cal'))
     if 'timestamp_cal' in merged.columns:
@@ -77,15 +89,20 @@ def process_data():
     # Feature Engineering: JSON expansion
     print("Expanding vehicle_type_dist JSON...")
     if 'vehicle_type_dist' in merged.columns:
-        # Optimized JSON parsing using list comprehension
         parsed_dicts = [
             json.loads(x) if isinstance(x, str) else {} 
             for x in merged['vehicle_type_dist']
         ]
         json_df = pd.DataFrame(parsed_dicts, index=merged.index)
-        
         merged = pd.concat([merged, json_df], axis=1)
         merged.drop(columns=['vehicle_type_dist'], inplace=True)
+
+    print("Handling comprehensive missing values and harmonizing categories...")
+    merged = handle_missing_values(merged)
+
+    # Data Validation & Quality Checks
+    print("Running Data Quality Validation...")
+    validate_data_quality(merged)
 
     # Export
     out_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'interim')
@@ -97,8 +114,7 @@ def process_data():
     print(f"Data processing complete. Final shape: {merged.shape}")
 
 def handle_missing_values(df: pd.DataFrame) -> pd.DataFrame:
-    # 1. Corrected spelling for temperature
-    numerical_columns = ["temperature", "rainfall", "visibility", "occupancy","avg_speed"]
+    numerical_columns = ["temperature", "rainfall", "visibility", "occupancy", "avg_speed"]
     
     categorical_fill_values = {
         "holiday_name": "No Holiday",
@@ -113,14 +129,11 @@ def handle_missing_values(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].fillna(default_val)
     
-    #Handling weather condition column
     if 'weather_condition' not in df.columns:
         return df
 
-    # 1. Clean whitespace and casing
     df['weather_condition'] = df['weather_condition'].astype(str).str.strip().str.lower()
 
-    # 2. Harmonize synonymous categories
     mapping = {
         'rainy': 'rain',
         'foggy': 'fog',
@@ -128,21 +141,54 @@ def handle_missing_values(df: pd.DataFrame) -> pd.DataFrame:
         'none': 'unknown'
     }
     df['weather_condition'] = df['weather_condition'].replace(mapping)
-
-    # 3. Fill remaining nulls
     df['weather_condition'] = df['weather_condition'].fillna('unknown')
 
     if "station_id" in df.columns:
-        df.drop(columns=["station_id"],inplace=True)
+        df.drop(columns=["station_id"], inplace=True)
+        
     return df
 
 def normalised_timestamp(df: pd.DataFrame) -> pd.DataFrame:
-    # Convert timestamp to datetime, handling any formatting issues
+    # Ensure column is datetime format
     df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
     
-    # Ensure timestamp interval is 30 minutes
+    # Assert that no rows failed datetime conversion
+    if df['timestamp'].isna().any():
+        n_invalid = df['timestamp'].isna().sum()
+        raise ValueError(f"Datetime conversion failed: Found {n_invalid} invalid or unparseable timestamps.")
+
+    # Ensure timestamp interval is rounded to 30 minutes
     df['timestamp'] = df['timestamp'].dt.round('30min')
     return df
+
+def validate_data_quality(df: pd.DataFrame):
+    print("Running Data Quality Checks...")
+    
+    # 1. Verify row counts
+    if len(df) == 0:
+        raise ValueError("Data validation failed: The processed dataframe is empty.")
+        
+    # 1b. Strictly verify that timestamp column exists and is of datetime type
+    if 'timestamp' not in df.columns:
+        raise ValueError("Data validation failed: 'timestamp' column is missing.")
+    if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+        raise TypeError(f"Data validation failed: 'timestamp' is of type {df['timestamp'].dtype}, expected datetime.")
+
+    # 2. Assert no nulls in critical modeling columns
+    critical_cols = ['road_id', 'timestamp', 'traffic_volume', 'avg_speed', 'occupancy']
+    missing_critical = df[critical_cols].isnull().sum()
+    if missing_critical.sum() > 0:
+        print("WARNING: Null values found in critical columns:")
+        print(missing_critical[missing_critical > 0])
+        
+    # 3. Confirm value ranges
+    if (df['traffic_volume'] < 0).any():
+        raise ValueError("Data validation failed: Negative traffic volume detected.")
+    if (df['occupancy'] < 0).any() or (df['occupancy'] > 100).any():
+        raise ValueError("Data validation failed: Occupancy out of bounds (0-100).")
+        
+    print("Data quality checks passed successfully!")
+
 
 if __name__ == "__main__":
     process_data()
