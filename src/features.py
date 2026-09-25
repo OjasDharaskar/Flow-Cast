@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import os
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     print("Engineering features...")
@@ -64,7 +65,13 @@ def missing_values_features(df: pd.DataFrame) -> pd.DataFrame:
     
     # Optional: Reset the index after dropping rows
     df = df.reset_index(drop=True)
-    
+    feature_out_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'Processed')
+    os.makedirs(feature_out_dir, exist_ok=True)
+    featured_dataset_path = os.path.join(feature_out_dir, 'featured_dataset.csv') 
+    print(f"Saving featured dataset to {featured_dataset_path}...") 
+    df.to_csv(featured_dataset_path, index=False)
+    print(f"Featured dataset saved to {featured_dataset_path}")
     return df
-
+    
+    
 
